@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 from collections.abc import (
     Callable,
     Collection,
@@ -3683,13 +3684,54 @@ class MultiIndex(Index):
                 mi = self[loc]
         return loc, mi
 
+    def _expected_level_type(levelno: int) -> str:
+        lev = self.levels[levelno]
+        dt = getattr(lev, "dtype", None)
+        return str(dt) if dt is not None else type(lev).__name__
+
+    def _is_key_type_compatible(key_val, levelno: int) -> bool:
+        lev = self.levels[levelno]
+        dt = getattr(lev, "dtype", None)
+
+        # Don't block if we cannot find out expected type
+        if not dt:
+            return True
+
+        kind = getattr(dt, "kind", None)
+
+        if kind == "O":
+            return True
+
+        # For datetime64
+        if kind == "M":
+            return isinstance(key_val, (np.datetime64, datetime.datetime, datetime.date, pd.Timestamp, str))
+
+        # For timedelta64
+        if kind == "m":
+            return isinstance(key_val, (np.timedelta64, datetime.timedelta, pd.Timedelta, str))
+
+        # For numeric-like
+        if kind in ("i", "u"):
+            return isinstance(key_val, (int, np.integer))
+        if kind == "f":
+            return isinstance(key_val, (float, int, np.floating, np.integer))
+        if kind == "b":
+            return isinstance(key_val, (bool, np.bool_))
+
+        # For string-likes
+        if kind in ("U", "S"):
+            return isinstance(key_val, str)
+
+        # By default, don't block type on incompatibility
+        return True
+
+
     def _get_loc_level(self, key, level: int | list[int] = 0):
         """
         get_loc_level but with `level` known to be positional, not name-based.
         """
 
-        # different name to distinguish from maybe_droplevels
-        def maybe_mi_droplevels(indexer, levels):
+        def droplevels(indexer, levels):
             """
             If level does not exist or all levels were dropped, the exception
             has to be handled outside.
@@ -3700,31 +3742,28 @@ class MultiIndex(Index):
                 new_index = new_index._drop_level_numbers([i])
 
             return new_index
-
-        if isinstance(level, (tuple, list)):
-            if len(key) != len(level):
-                raise AssertionError(
-                    "Key for location must have same length as number of levels"
+        
+        if isinstance(key, tuple):
+            for ind, val in enumerate(key):
+                if not _is_key_type_compatible(val, ind):
+                    raise TypeError(
+                        f"Error: Type mismatch at index level {ind}: "
+                        f"Expected {_expected_level_type(ind)}, "
+                        f"Got {type(val).__name__}"
+                    )
+        else:
+            if not _is_key_type_compatible(key, level):
+                raise TypeError(
+                    f"Error: Type mismatch at index level {level}: "
+                    f"Expected {_expected_level_type(level)}, "
+                    f"Got {type(key).__name__}"
                 )
-            result = None
-            for lev, k in zip(level, key, strict=True):
-                loc, new_index = self._get_loc_level(k, level=lev)
-                if isinstance(loc, slice):
-                    mask = np.zeros(len(self), dtype=bool)
-                    mask[loc] = True
-                    loc = mask
-                result = loc if result is None else result & loc
+                    try:
+                        mi = droplevels(result, level)
+                    except ValueError:
+                        mi = self[result]
 
-            try:
-                # FIXME: we should be only dropping levels on which we are
-                #  scalar-indexing
-                mi = maybe_mi_droplevels(result, level)
-            except ValueError:
-                # droplevel failed because we tried to drop all levels,
-                #  i.e. len(level) == self.nlevels
-                mi = self[result]
-
-            return result, mi
+                    return result, mi
 
         # kludge for #1796
         if isinstance(key, list):
